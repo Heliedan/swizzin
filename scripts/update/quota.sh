@@ -13,6 +13,7 @@ Cmnd_Alias   QUOTA = /usr/bin/quota
 
 www-data     ALL = (ALL) NOPASSWD: QUOTA
 EOSUD
+        chmod 0440 /etc/sudoers.d/quota
         echo_progress_done
     fi
 fi

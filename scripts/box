@@ -350,6 +350,7 @@ Cmnd_Alias   ${USER}CMDS = /bin/systemctl stop flood@${user}, /bin/systemctl res
 
 ${user}     ALL = (ALL) NOPASSWD: ${USER}CMDS
 SUD
+        chmod 0440 /etc/sudoers.d/"${user}"
     fi
 
     if [[ -f /install/.nginx.lock ]]; then

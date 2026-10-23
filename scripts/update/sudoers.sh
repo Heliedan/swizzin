@@ -7,6 +7,7 @@ distribution=$(lsb_release -is)
 if [[ ! -f /etc/sudoers.d/env_keep ]] && [[ $distribution = "Ubuntu" ]]; then
     echo_info "Adding env_keep to sudoers"
     echo 'Defaults  env_keep -="HOME"' > /etc/sudoers.d/env_keep
+    chmod 0440 /etc/sudoers.d/env_keep
 fi
 
 # TODO this should probably skip the master?
@@ -49,6 +50,7 @@ Cmnd_Alias   GENERALCMNDS = /usr/sbin/repquota, /bin/systemctl
 www-data     ALL = (ALL) NOPASSWD: CLEANMEM, SYSCMNDS, GENERALCMNDS
 
 SUD
+        chmod 0440 /etc/sudoers.d/panel
     fi
 fi
 
@@ -57,3 +59,12 @@ if ! groups "$master" | grep -q sudo; then
     usermod -a -G sudo "$master"
     # rm /etc/sudoers.d/swizzin
 fi
+
+# Files in /etc/sudoers.d are expected to be 0440: earlier versions wrote them with the default
+# umask (0644), which "visudo -c" reports as an error on every check.
+for f in /etc/sudoers.d/{secure_path,env_keep,panel,quota} "${users[@]/#//etc/sudoers.d/}"; do
+    if [[ -f $f ]] && [[ $(stat -c %a "$f") != 440 ]]; then
+        echo_log_only "Setting $f to 0440"
+        chmod 0440 "$f"
+    fi
+done

@@ -59,6 +59,7 @@ Cmnd_Alias   SYSDCMNDS = /bin/systemctl start *, /bin/systemctl stop *, /bin/sys
 
 swizzin     ALL = (ALL) NOPASSWD: CMNDS, SYSDCMNDS
 EOSUD
+        chmod 0440 /etc/sudoers.d/panel
     fi
 
     if grep -q -E "swizzin.*/bin/sh" /etc/passwd; then

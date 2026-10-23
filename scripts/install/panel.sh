@@ -115,6 +115,7 @@ Cmnd_Alias   SYSDCMNDS = /bin/systemctl start *, /bin/systemctl stop *, /bin/sys
 
 swizzin     ALL = (ALL) NOPASSWD: CMNDS, SYSDCMNDS
 EOSUD
+chmod 0440 /etc/sudoers.d/panel
 
 systemctl enable -q --now panel >> ${log} 2>&1
 echo_progress_done "Panel started"
