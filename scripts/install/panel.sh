@@ -11,6 +11,12 @@
 #
 #! /bin/bash
 
+# altdash, an edition of the panel, takes its place: the two use the same folders, service and port
+if [[ -f /install/.altdash.lock ]]; then
+    echo_error "altdash is installed in place of the panel. For the panel: box remove altdash, then box install panel"
+    exit 1
+fi
+
 if [[ ! -f /install/.nginx.lock ]]; then
     echo_warn "This package requires nginx to be installed!"
     if ask "Install nginx?" Y; then

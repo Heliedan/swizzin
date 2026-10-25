@@ -1,0 +1,464 @@
+#!/bin/bash
+# altdash: Heliedan's edition of the Swizzin panel (https://github.com/Heliedan/swizzin_dashboard)
+# Heliedan 2026 for Swizzin
+#
+# altdash takes the place of the panel. It uses the panel's user (swizzin), folder (/opt/swizzin), venv
+# (/opt/.venv/swizzin), port (8333), service (panel), nginx file (apps/panel.conf) and sudoers file (sudoers.d/panel),
+# so that the rest of Swizzin keeps working with it. Only its lock differs (/install/.altdash.lock): the panel's
+# update, upgrade and remove scripts leave it alone, and install/panel.sh refuses to run while it is installed.
+#
+# Its App Store installs Swizzin applications from the panel, through a small service that runs box as root
+# (swizzin-store). That service is optional: ALTDASH_STORE=yes or no, or a question at the first install. The choice
+# is kept for upgrades.
+#
+# The results of these functions are left in variables (altdash_version, altdash_with_store), not printed: the echo_*
+# functions print to stdout, so a message would end up in a captured result.
+
+#shellcheck source=sources/functions/utils
+. /etc/swizzin/sources/functions/utils
+
+altdash_repo="https://github.com/Heliedan/swizzin_dashboard"
+altdash_backups="/var/backups/altdash"
+altdash_new="/opt/.altdash.new"
+altdash_old="/opt/.altdash.old"
+altdash_venv="/opt/.venv/swizzin"
+# What the App Store service puts in place (store-helper/install.sh of the edition). Its logs (/var/log/swizzin-store)
+# and the copies of the settings of the apps it uninstalled (/var/backups/swizzin-store) are never deleted.
+altdash_store_files=(
+    /etc/systemd/system/swizzin-store.service
+    /etc/systemd/system/multi-user.target.wants/swizzin-store.service
+    /etc/systemd/system/swizzin-store.service.d
+    /etc/needrestart/conf.d/swizzin-store.conf
+    /usr/local/lib/swizzin-store
+)
+
+# Prints yes or no for the value of an ALTDASH_* variable, nothing when it is empty. Returns 1 for anything else.
+_altdash_yes_no() {
+    case "${1,,}" in
+        "") ;;
+        y | yes | true | 1) echo yes ;;
+        n | no | false | 0) echo no ;;
+        *) return 1 ;;
+    esac
+}
+
+# The ALTDASH_* variables, checked before anything is asked or changed.
+altdash_check_variables() {
+    local name
+    for name in ALTDASH_STORE ALTDASH_REPLACE_PANEL; do
+        if ! _altdash_yes_no "${!name}" > /dev/null; then
+            echo_error "$name must be yes or no"
+            return 1
+        fi
+    done
+    if [[ -n $ALTDASH_TAG ]] && ! _altdash_release_ok "$ALTDASH_TAG"; then
+        echo_error "ALTDASH_TAG must be a release of altdash from heliedan-2.4 on (got \"$ALTDASH_TAG\")"
+        return 1
+    fi
+}
+
+# True for a release tag of the edition that works with these scripts: heliedan-2.4 or later.
+_altdash_release_ok() {
+    [[ $1 =~ ^heliedan-[0-9]+(\.[0-9]+)*$ ]] && dpkg --compare-versions "${1#heliedan-}" ge 2.4
+}
+
+# Sets altdash_version to the release to install: $ALTDASH_TAG, or the latest release of the edition.
+altdash_release() {
+    altdash_version="$ALTDASH_TAG"
+    if [[ -z $altdash_version ]]; then
+        altdash_version=$(github_latest_version Heliedan/swizzin_dashboard) || altdash_version=""
+    fi
+    if ! _altdash_release_ok "$altdash_version"; then
+        echo_error "Could not tell which release of altdash to install (got \"$altdash_version\")"
+        return 1
+    fi
+}
+
+# Sets altdash_with_store to yes or no: $ALTDASH_STORE, else the choice made at the last install or upgrade, else the
+# answer to a question (Yes when nobody can answer it).
+altdash_choose_store() {
+    altdash_with_store=$(_altdash_yes_no "$ALTDASH_STORE")
+    if [[ -z $altdash_with_store ]]; then
+        altdash_with_store=$(swizdb get altdash/store 2> /dev/null) || altdash_with_store=""
+    fi
+    if [[ $altdash_with_store != yes && $altdash_with_store != no ]]; then
+        echo_info "The App Store installs Swizzin applications from the panel. It needs a small service that runs box as root."
+        if ask "Install the App Store?" Y; then
+            altdash_with_store=yes
+        else
+            altdash_with_store=no
+        fi
+    fi
+}
+
+# The system's python3, that the App Store service runs on, must be 3.8 or newer. So must the panel's venv, which the
+# panel user owns: its Python runs as that user (-I -S: nothing of the venv is read).
+altdash_check_python() {
+    if ! /usr/bin/python3 -I -S -c 'import sys; sys.exit(sys.version_info < (3, 8))' > /dev/null 2>&1; then
+        echo_error "altdash needs Python 3.8 or newer: /usr/bin/python3 is older, or missing"
+        return 1
+    fi
+    if [[ -e $altdash_venv ]] && ! sudo -u swizzin -H "$altdash_venv/bin/python" -I -S -c 'import sys; sys.exit(sys.version_info < (3, 8))' > /dev/null 2>&1; then
+        echo_error "altdash needs Python 3.8 or newer: the panel's venv ($altdash_venv) is older, or broken"
+        return 1
+    fi
+}
+
+# True when any piece of the App Store service is there, or when it still runs.
+altdash_store_installed() {
+    local f
+    for f in "${altdash_store_files[@]}"; do
+        [[ -e $f || -L $f ]] && return 0
+    done
+    systemctl -q is-active swizzin-store 2> /dev/null
+}
+
+# True when the App Store service runs an installation or an uninstallation, or does not answer: those are never cut
+# off, so any doubt counts as busy.
+altdash_store_busy() {
+    local job
+    systemctl -q is-active swizzin-store 2> /dev/null || return 1
+    job=$(/usr/bin/python3 -I -c '
+import json, socket
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect("/run/swizzin-store/store.sock")
+s.sendall(b"{\"op\": \"catalogue\"}\n")
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+print("none" if json.loads(data).get("job") is None else "busy")' 2> /dev/null) || job=""
+    [[ $job != none ]]
+}
+
+# Installs the App Store service from the copy of the edition's store-helper folder in $1. Its install.sh runs only
+# from files that root alone can write, which /opt/swizzin (the panel user's) is not: hence a copy that root owns.
+# It needs the edition in /opt/swizzin already: the service does not start without it.
+altdash_store_install() {
+    echo_progress_start "Installing the App Store service"
+    bash "$1/install.sh" >> "$log" 2>&1 || {
+        echo_warn "The App Store service could not be installed"
+        return 1
+    }
+    echo_progress_done "App Store service installed"
+}
+
+# Removes the App Store service. Written out here, so that it works even when /opt/swizzin is broken or gone.
+altdash_store_remove() {
+    altdash_store_installed || return 0
+    echo_progress_start "Removing the App Store service"
+    systemctl disable -q --now swizzin-store >> "$log" 2>&1 || systemctl stop swizzin-store >> "$log" 2>&1
+    rm -rf "${altdash_store_files[@]}"
+    systemctl daemon-reload
+    systemctl reset-failed swizzin-store >> "$log" 2>&1
+    if altdash_store_installed; then
+        echo_warn "The App Store service could not be removed completely"
+        return 1
+    fi
+    echo_progress_done "App Store service removed"
+}
+
+# A root-owned copy of the store-helper folder of the edition in $1, in a new folder under /root. Prints its path.
+altdash_store_copy() {
+    local copy
+    copy=$(mktemp -d /root/altdash-store.XXXXXX) || return 1
+    if ! cp -r "$1/store-helper/." "$copy/" || ! chown -R root:root "$copy" || ! chmod -R go-w "$copy"; then
+        rm -rf "$copy"
+        return 1
+    fi
+    echo "$copy"
+}
+
+# The same service and sudo rights as install/panel.sh writes for the panel. The sudo rights are checked with visudo
+# and put in place in one step: a broken file in /etc/sudoers.d would break sudo for the whole system.
+altdash_write_service() {
+    local rules
+    cat > /etc/systemd/system/panel.service << EOS
+[Unit]
+Description=swizzin panel service
+After=nginx.service
+
+[Service]
+Type=simple
+User=swizzin
+
+ExecStart=/opt/.venv/swizzin/bin/python swizzin.py
+WorkingDirectory=/opt/swizzin
+Restart=on-failure
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOS
+    systemctl daemon-reload
+
+    rules=/etc/sudoers.d/.panel.altdash # sudo skips the files of sudoers.d whose name has a dot
+    cat > "$rules" << EOSUD
+#Defaults  env_keep -="HOME"
+Defaults:swizzin !logfile
+Defaults:swizzin !syslog
+Defaults:swizzin !pam_session
+
+Cmnd_Alias   CMNDS = /usr/bin/quota
+Cmnd_Alias   SYSDCMNDS = /bin/systemctl start *, /bin/systemctl stop *, /bin/systemctl restart *, /bin/systemctl disable *, /bin/systemctl enable *
+
+swizzin     ALL = (ALL) NOPASSWD: CMNDS, SYSDCMNDS
+EOSUD
+    if ! chmod 0440 "$rules" || ! visudo -cqf "$rules" || ! mv -f "$rules" /etc/sudoers.d/panel; then
+        rm -f "$rules"
+        echo_warn "Could not write the panel's sudo rights (/etc/sudoers.d/panel)"
+        return 1
+    fi
+}
+
+# swizzin.cfg of the panel in /opt/swizzin (the admin is the master user, as install/panel.sh sets it) and nginx.
+altdash_configure() {
+    local master
+    if [[ -L /opt/swizzin/swizzin.cfg ]]; then
+        echo_warn "/opt/swizzin/swizzin.cfg is a symbolic link: altdash does not write through it"
+        return 1
+    fi
+    master=$(_get_master_username)
+    if [[ $master != "$(id -nu 1000 2> /dev/null)" ]] && ! grep -qs "^ADMIN_USER" /opt/swizzin/swizzin.cfg; then
+        echo "ADMIN_USER = '$master'" >> /opt/swizzin/swizzin.cfg
+    fi
+    if [[ -f /install/.nginx.lock ]]; then
+        bash /usr/local/bin/swizzin/nginx/altdash.sh || return 1
+        nginx -t >> "$log" 2>&1 || {
+            echo_warn "nginx refuses its configuration with altdash (nginx -t)"
+            return 1
+        }
+        systemctl reload nginx
+    fi
+}
+
+# Waits up to 90 seconds for the panel to answer on its port.
+altdash_wait_panel() {
+    local i
+    for i in $(seq 90); do
+        if systemctl -q is-active panel && curl -s -o /dev/null --max-time 2 http://127.0.0.1:8333/; then
+            return 0
+        fi
+        echo_log_only "Waiting for the panel to answer ($i)"
+        sleep 1
+    done
+    return 1
+}
+
+# What the user put in the panel goes into the new one: swizzin.cfg, the custom tiles (core/custom/profiles.py), and
+# the files added next to the code (icons of custom tiles, for one), which box upgrade panel keeps too.
+_altdash_keep_user_files() {
+    local f
+    if [[ -L /opt/swizzin/swizzin.cfg ]]; then
+        echo_error "/opt/swizzin/swizzin.cfg is a symbolic link: altdash does not copy it. Replace it with a file first"
+        return 1
+    fi
+    if [[ -f /opt/swizzin/swizzin.cfg ]]; then
+        cp -a /opt/swizzin/swizzin.cfg "$altdash_new/" || return 1
+    fi
+    if [[ -f /opt/swizzin/core/custom/profiles.py ]]; then
+        cp -a /opt/swizzin/core/custom/profiles.py "$altdash_new/core/custom/" || return 1
+    fi
+    [[ -d /opt/swizzin/.git ]] || return 0
+    while IFS= read -r -d '' f; do
+        [[ -e $altdash_new/$f || -L $altdash_new/$f ]] && continue
+        (cd /opt/swizzin && cp -a --parents -- "$f" "$altdash_new/") || return 1
+    done < <(sudo -u swizzin -H git -C /opt/swizzin ls-files -z --others --exclude-standard 2> /dev/null)
+}
+
+# Puts release $altdash_version of the edition in /opt/swizzin, in place of what is there (nothing, the panel, or an
+# older altdash), with the App Store service or without it ($altdash_with_store), and starts it. A failure, or an
+# interruption (Ctrl+C, a lost SSH session), puts everything back as it was: the panel, its service, sudo and nginx
+# files, its venv and the App Store service. The locks are left to the caller.
+altdash_deploy() {
+    # Read by _altdash_rollback, which runs from here
+    local rollback="" store_copy="" store_was_active=no swapped=no store_touched=no
+    local venv_saved=no venv_changed=no panel_was_active=no f
+
+    # An earlier run that stopped between its two moves left the previous panel aside: it goes back first.
+    if [[ -e $altdash_old && ! -e /opt/swizzin ]]; then
+        echo_warn "Putting back the panel that an interrupted run left in $altdash_old"
+        mv -T "$altdash_old" /opt/swizzin || return 1
+    elif [[ -e $altdash_old ]]; then
+        install -d -m 0700 "$altdash_backups"
+        mv -T "$altdash_old" "$altdash_backups/interrupted-$(date +%Y%m%d-%H%M%S)" || return 1
+    fi
+    rm -rf "$altdash_new" /root/altdash-store.*
+    if [[ -f /install/.nginx.lock ]] && ! nginx -t >> "$log" 2>&1; then
+        echo_error "nginx refuses its current configuration (nginx -t): fix it first, nothing was changed"
+        return 1
+    fi
+
+    echo_progress_start "Downloading altdash $altdash_version"
+    if ! git clone --quiet --depth 1 --branch "$altdash_version" "$altdash_repo" "$altdash_new" >> "$log" 2>&1 ||
+        [[ ! -s $altdash_new/swizzin.py || ! -s $altdash_new/store-helper/swizzin_store.py ]]; then
+        rm -rf "$altdash_new"
+        echo_error "Could not download altdash $altdash_version: nothing was changed"
+        return 1
+    fi
+    # Taken before the files are handed to the panel user, so that root runs only what it downloaded itself
+    store_copy=$(altdash_store_copy "$altdash_new") || store_copy=""
+    rollback=$(mktemp -d /root/altdash-rollback.XXXXXX) || rollback=""
+    if [[ -z $store_copy || -z $rollback ]]; then
+        rm -rf "$altdash_new" "$store_copy" "$rollback"
+        echo_error "Could not prepare altdash (is /root full?): nothing was changed"
+        return 1
+    fi
+    trap '_altdash_interrupted' INT TERM HUP
+    if [[ -d /opt/swizzin ]] && ! _altdash_keep_user_files; then
+        _altdash_rollback "Could not carry your panel settings over"
+        return 1
+    fi
+    chown -R swizzin: "$altdash_new"
+    echo_progress_done "altdash downloaded"
+
+    # The venv is shared with the panel that is there now: saved first, to be put back if anything fails
+    echo_progress_start "Installing python dependencies"
+    cp -a "$altdash_venv" "$rollback/venv" && venv_saved=yes
+    if [[ $venv_saved != yes ]]; then
+        _altdash_rollback "Could not save the panel's venv"
+        return 1
+    fi
+    venv_changed=yes
+    # shellcheck disable=SC2024 # the log is root's: this shell writes it, not the panel user
+    if ! sudo -u swizzin -H "$altdash_venv/bin/pip" install --no-cache-dir --upgrade pip wheel >> "$log" 2>&1 ||
+        ! sudo -u swizzin -H "$altdash_venv/bin/pip" install --no-cache-dir -r "$altdash_new/requirements.txt" >> "$log" 2>&1; then
+        _altdash_rollback "Could not install the python dependencies of altdash"
+        return 1
+    fi
+    # shellcheck disable=SC2024 # the log is root's: this shell writes it, not the panel user
+    if ! sudo -u swizzin -H bash -c "cd $altdash_new && $altdash_venv/bin/python -c 'import core.util, core.custom.live_stats, core.custom.store'" >> "$log" 2>&1; then
+        _altdash_rollback "altdash $altdash_version does not load with this server's Python"
+        return 1
+    fi
+    echo_progress_done "Dependencies installed"
+
+    # Saved to be put back as they were: the panel's files, and the App Store service (root's own files)
+    for f in /etc/systemd/system/panel.service /etc/sudoers.d/panel /etc/nginx/apps/panel.conf; do
+        if [[ -e $f ]] && ! cp -a "$f" "$rollback/"; then
+            _altdash_rollback "Could not save $f"
+            return 1
+        fi
+    done
+    if altdash_store_installed; then
+        systemctl -q is-active swizzin-store && store_was_active=yes
+        mkdir "$rollback/store"
+        for f in "${altdash_store_files[@]}"; do
+            if [[ -e $f || -L $f ]] && ! cp -a --parents "$f" "$rollback/store/"; then
+                _altdash_rollback "Could not save the App Store service"
+                return 1
+            fi
+        done
+    fi
+
+    echo_progress_start "Starting altdash"
+    # Stopped first: with no panel, nobody can start an installation from the App Store, which is never cut off
+    systemctl -q is-active panel && panel_was_active=yes
+    systemctl stop panel >> "$log" 2>&1
+    if altdash_store_busy; then
+        _altdash_rollback "The App Store is installing or uninstalling an application (or its service does not answer): try again once it is done"
+        return 1
+    fi
+    if [[ -e /opt/swizzin ]] && ! mv -T /opt/swizzin "$altdash_old"; then
+        _altdash_rollback "Could not move the panel aside"
+        return 1
+    fi
+    if ! mv -T "$altdash_new" /opt/swizzin; then
+        [[ -e $altdash_old ]] && mv -T "$altdash_old" /opt/swizzin
+        _altdash_rollback "Could not put altdash in place"
+        return 1
+    fi
+    swapped=yes
+    if ! altdash_write_service || ! altdash_configure; then
+        _altdash_rollback "Could not configure altdash"
+        return 1
+    fi
+    store_touched=yes
+    if [[ $altdash_with_store == yes ]]; then
+        if ! altdash_store_install "$store_copy"; then
+            _altdash_rollback "Could not install the App Store service"
+            return 1
+        fi
+    elif ! altdash_store_remove; then
+        _altdash_rollback "Could not remove the App Store service"
+        return 1
+    fi
+    systemctl enable -q panel >> "$log" 2>&1
+    systemctl restart panel
+    if ! altdash_wait_panel; then
+        _altdash_rollback "The panel did not start with altdash $altdash_version (journalctl -u panel says why)"
+        return 1
+    fi
+    trap - INT TERM HUP
+    echo_progress_done "altdash started"
+
+    # The previous panel is kept: the official one that the first install replaced, and the last altdash before this one
+    if [[ -e $altdash_old ]]; then
+        install -d -m 0700 "$altdash_backups"
+        if [[ -f /install/.altdash.lock ]]; then
+            find "$altdash_backups" -mindepth 1 -maxdepth 1 -name 'altdash-*' -exec rm -rf {} +
+            mv -T "$altdash_old" "$altdash_backups/altdash-$(date +%Y%m%d-%H%M%S)"
+        else
+            mv -T "$altdash_old" "$altdash_backups/panel-$(date +%Y%m%d-%H%M%S)"
+        fi
+    fi
+    rm -rf "$rollback" "$store_copy"
+    swizdb set altdash/store "$altdash_with_store"
+    swizdb set altdash/release "$altdash_version"
+}
+
+# Ctrl+C or a lost SSH session during altdash_deploy
+_altdash_interrupted() {
+    _altdash_rollback "Interrupted"
+    exit 1
+}
+
+# altdash_deploy's way back, with its variables: what it changed so far is put back as it was. $1 says why.
+_altdash_rollback() {
+    local saved name
+    trap '' INT TERM HUP # nothing interrupts the way back
+    echo_warn "$1: putting back what was there before"
+    if [[ $swapped == yes ]]; then
+        systemctl stop panel >> "$log" 2>&1
+        rm -rf /opt/swizzin
+        [[ -e $altdash_old ]] && mv -T "$altdash_old" /opt/swizzin
+        if [[ ! -e $rollback/panel.service ]]; then # a first install: the panel had no service
+            systemctl disable -q panel >> "$log" 2>&1
+        fi
+        for saved in /etc/systemd/system/panel.service /etc/sudoers.d/panel /etc/nginx/apps/panel.conf; do
+            name=$(basename "$saved")
+            if [[ -e $rollback/$name ]]; then
+                cp -a "$rollback/$name" "$saved"
+            else
+                rm -f "$saved"
+            fi
+        done
+        systemctl daemon-reload
+        if [[ -f /install/.nginx.lock ]] && nginx -t >> "$log" 2>&1; then
+            systemctl reload nginx
+        fi
+    fi
+    if [[ $store_touched == yes ]]; then
+        altdash_store_remove
+        if [[ -d $rollback/store ]]; then
+            cp -a "$rollback/store/." /
+            systemctl daemon-reload
+            [[ $store_was_active == yes ]] && systemctl restart swizzin-store
+        fi
+    fi
+    if [[ $venv_saved == yes && $venv_changed == yes ]]; then
+        rm -rf "$altdash_venv"
+        mv -T "$rollback/venv" "$altdash_venv"
+    fi
+    rm -rf "$altdash_new"
+    # The panel put back runs again, on its own venv
+    if [[ $panel_was_active == yes ]] || { [[ $venv_changed == yes ]] && systemctl -q is-active panel; }; then
+        systemctl restart panel
+    fi
+    rm -rf "$rollback" "$store_copy"
+    trap - INT TERM HUP
+    echo_error "altdash $altdash_version could not be set up: everything was put back as it was"
+}

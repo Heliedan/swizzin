@@ -308,7 +308,7 @@ function _adduser() {
     chown "$user": /home/"$user"/.config
     chmod 750 /home/"${user}"
 
-    if [[ -f /install/.panel.lock ]]; then setfacl -m g:swizzin:rx /home/"${user}"; fi
+    if [[ -f /install/.panel.lock || -f /install/.altdash.lock ]]; then setfacl -m g:swizzin:rx /home/"${user}"; fi
     echo "D /var/run/${user} 0750 ${user} ${user} -" >> /etc/tmpfiles.d/"${user}".conf
     systemd-tmpfiles /etc/tmpfiles.d/"${user}".conf --create >> $log 2>&1
 

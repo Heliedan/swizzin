@@ -8,6 +8,7 @@
 
 // packages
 $L['AIRSONIC'] = 'Airsonic is a web-based audio player. It is a maintained forked of Subsonic, with the paid components modified to be free.';
+$L['ALTDASH'] = 'An edition of the panel, in its place: live CPU, RAM and disk cards, an App Store to install Swizzin applications from the browser, and a limit on password attempts.';
 $L['AUTOBRR'] = 'A powerful modern autodl alternative, which monitors IRC announce channels to get releases as soon as they are available and send to your favorite client.';
 $L['BAZARR'] = 'The "-arr" tool to manage subtitles for items in Sonarr and Radarr.';
 $L['BTSYNC'] = 'BitTorrent Sync by BitTorrent aka Resilio is a proprietary peer-to-peer file synchronization tool.';
